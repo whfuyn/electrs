@@ -483,7 +483,7 @@ async fn run_server(config: Arc<Config>, query: Arc<Query>, rx: oneshot::Receive
     let config = Arc::clone(&config);
     let query = Arc::clone(&query);
 
-    let make_service_fn_inn = || {
+    let make_service_fn_inn = move || {
         let query = Arc::clone(&query);
         let config = Arc::clone(&config);
 
@@ -516,39 +516,47 @@ async fn run_server(config: Arc<Config>, query: Arc<Query>, rx: oneshot::Receive
         }
     };
 
-    let server = match socket_file {
-        None => {
-            info!("REST server running on {}", addr);
-
-            let socket = create_socket(&addr);
-            socket.listen(511).expect("setting backlog failed");
-
-            Server::from_tcp(socket.into())
-                .expect("Server::from_tcp failed")
-                .serve(make_service_fn(move |_| make_service_fn_inn()))
-                .with_graceful_shutdown(async {
-                    rx.await.ok();
-                })
-                .await
-        }
-        Some(path) => {
+    let (chained_tx, chained_rx) = oneshot::channel();
+    if let Some(path) = socket_file {
+        let make_service_fn_inn_cloned = make_service_fn_inn.clone();
+        let path = path.clone();
+        tokio::spawn(async move {
             if let Ok(meta) = fs::metadata(&path) {
                 // Cleanup socket file left by previous execution
                 if meta.file_type().is_socket() {
-                    fs::remove_file(path).ok();
+                    fs::remove_file(&path).ok();
                 }
             }
 
             info!("REST server running on unix socket {}", path.display());
 
-            Server::bind_unix(path)
+            let res = Server::bind_unix(path)
                 .expect("Server::bind_unix failed")
-                .serve(make_service_fn(move |_| make_service_fn_inn()))
+                .serve(make_service_fn(move |_| make_service_fn_inn_cloned()))
                 .with_graceful_shutdown(async {
-                    rx.await.ok();
+                    chained_rx.await.ok();
                 })
-                .await
-        }
+                .await;
+            if let Err(e) = res {
+                eprintln!("server error: {}", e);
+            }
+        });
+    }
+
+    let server = {
+        info!("REST server running on {}", addr);
+
+        let socket = create_socket(&addr);
+        socket.listen(511).expect("setting backlog failed");
+
+        Server::from_tcp(socket.into())
+            .expect("Server::from_tcp failed")
+            .serve(make_service_fn(move |_| make_service_fn_inn()))
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+                chained_tx.send(()).ok();
+            })
+            .await
     };
 
     if let Err(e) = server {
